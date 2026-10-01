@@ -1,4 +1,5 @@
 streamlit
 anthropic
+google-genai
 yfinance
 pandas

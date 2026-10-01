@@ -7,6 +7,7 @@ Agents:
   3. Bear analyst     - argues the stock is risky
   4. Judge            - a portfolio manager who weighs the debate and returns a JSON verdict
 
+Works with Google Gemini (free tier) or Anthropic Claude.
 Run:  streamlit run app.py
 Educational project only. Not financial advice.
 """
@@ -15,10 +16,13 @@ import base64
 import json
 import os
 import re
+import time
 
 import anthropic
 import streamlit as st
 import yfinance as yf
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="Bull vs Bear", page_icon="🐂", layout="wide")
 
@@ -29,16 +33,98 @@ LABEL = {"bull": "Bull", "bear": "Bear"}
 # ---------------------------------------------------------------- Sidebar
 with st.sidebar:
     st.header("Settings")
+    provider = st.radio("AI provider", ["Google Gemini (free tier)", "Anthropic Claude"])
+    GEMINI = provider.startswith("Google")
     api_key = st.text_input(
-        "Anthropic API key",
+        "Gemini API key" if GEMINI else "Anthropic API key",
         type="password",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
-        help="Or set the ANTHROPIC_API_KEY environment variable.",
+        value=os.getenv("GEMINI_API_KEY" if GEMINI else "ANTHROPIC_API_KEY", ""),
     )
-    model = st.text_input("Model", value="claude-sonnet-5-5")
+    model = st.text_input("Model", value="gemini-flash-latest" if GEMINI else "claude-sonnet-5-5")
     rounds = st.slider("Debate rounds", 1, 4, 3)
     max_words = st.slider("Max words per turn", 80, 300, 150, step=10)
     st.caption("Educational tool. Not financial advice.")
+
+
+# ---------------------------------------------------------------- LLM layer (one place for both providers)
+def make_client():
+    return genai.Client(api_key=api_key) if GEMINI else anthropic.Anthropic(api_key=api_key)
+
+
+def is_rate_limit(e):
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate_limit" in msg
+
+
+def friendly_error(e):
+    if is_rate_limit(e):
+        return "You've hit the API rate limit. Wait a minute and try again, or lower the number of rounds."
+    if "API key" in str(e) or "401" in str(e) or "authentication" in str(e).lower():
+        return "Your API key wasn't accepted. Check it in the sidebar."
+    return f"The AI provider returned an error: {e}"
+
+
+def generate(client, prompt, system=None, max_tokens=1500, pdfs=None):
+    """One complete (non-streamed) response. pdfs = list of (file name, bytes)."""
+    for attempt in range(3):
+        try:
+            if GEMINI:
+                contents = []
+                for name, data in pdfs or []:
+                    contents.append(f"Document: {name}")
+                    contents.append(types.Part.from_bytes(data=data, mime_type="application/pdf"))
+                contents.append(prompt)
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    # Flash models "think" before answering, and that uses output tokens, so leave room
+                    config=types.GenerateContentConfig(
+                        system_instruction=system, max_output_tokens=max(max_tokens, 8192)
+                    ),
+                )
+                return resp.text or ""
+
+            content = []
+            for name, data in pdfs or []:
+                content.append({"type": "text", "text": f"Document: {name}"})
+                content.append({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf",
+                               "data": base64.standard_b64encode(data).decode()},
+                })
+            content.append({"type": "text", "text": prompt})
+            kwargs = {"system": system} if system else {}
+            msg = client.messages.create(
+                model=model, max_tokens=max_tokens,
+                messages=[{"role": "user", "content": content}], **kwargs,
+            )
+            return "".join(b.text for b in msg.content if b.type == "text")
+        except Exception as e:
+            if is_rate_limit(e) and attempt < 2:
+                time.sleep(30)
+                continue
+            raise
+
+
+def stream(client, system, prompt, max_tokens):
+    """Yield text chunks so Streamlit can show each argument as it is written."""
+    if GEMINI:
+        for chunk in client.models.generate_content_stream(
+            model=model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system, max_output_tokens=max(max_tokens, 8192)
+            ),
+        ):
+            if chunk.text:
+                yield chunk.text
+    else:
+        with client.messages.stream(
+            model=model, max_tokens=max_tokens, system=system,
+            messages=[{"role": "user", "content": prompt}],
+        ) as s:
+            for text in s.text_stream:
+                yield text
 
 
 # ---------------------------------------------------------------- Market data
@@ -92,31 +178,15 @@ Debt/Equity (as reported by Yahoo): {val('debtToEquity')}"""
 # ---------------------------------------------------------------- Agents
 def digest_pdfs(client, files, company):
     """Document analyst: read all PDFs once and produce a shared digest."""
-    content = []
-    for f in files:
-        content.append({"type": "text", "text": f"Document: {f.name}"})
-        content.append({
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": base64.standard_b64encode(f.getvalue()).decode(),
-            },
-        })
-    content.append({"type": "text", "text": f"""You are a sell-side research analyst covering {company}.
+    prompt = f"""You are a sell-side research analyst covering {company}.
 Write a neutral digest of these documents for an investment debate. Use these sections:
 1. Financial performance (revenue, profit, margins vs last year and last quarter, with numbers)
 2. Management guidance and outlook
 3. Positives highlighted by management
 4. Risks, weaknesses, or concerns (including anything management avoided or deflected)
 5. Notable analyst Q&A moments
-Cite the source for each point as [document name, p.X]. Do not add opinions or outside information."""})
-
-    msg = client.messages.create(
-        model=model, max_tokens=2500,
-        messages=[{"role": "user", "content": content}],
-    )
-    return "".join(b.text for b in msg.content if b.type == "text")
+Cite the source for each point as [document name, p.X]. Do not add opinions or outside information."""
+    return generate(client, prompt, max_tokens=2500, pdfs=[(f.name, f.getvalue()) for f in files])
 
 
 def debater_system(side, company, evidence, focus):
@@ -157,18 +227,6 @@ Respond with ONLY a JSON object, no other text, with these keys:
   "unsupported_claims": ["..."],
   "reasoning": "3-5 sentences"
 }"""
-
-
-def stream_turn(client, system, user):
-    """Yield text chunks so Streamlit can show the argument as it is written."""
-    with client.messages.stream(
-        model=model,
-        max_tokens=max_words * 2 + 200,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
 
 
 def round_name(i, total):
@@ -236,10 +294,8 @@ def download_button(result):
     )
     md += f"\n\n## Verdict\n```json\n{json.dumps(result['verdict'], indent=2) if result['verdict'] else result['raw']}\n```\n"
     st.download_button(
-        "Download transcript",
-        md,
-        file_name=f"bull_bear_{result['ticker']}.md",
-        mime="text/markdown",
+        "Download transcript", md,
+        file_name=f"bull_bear_{result['ticker']}.md", mime="text/markdown",
     )
 
 
@@ -265,9 +321,7 @@ st.write("Two AI analysts debate a stock using live market data and your documen
 
 col1, col2 = st.columns([1, 2])
 ticker = col1.text_input("Ticker", value="INFY.NS", help="NSE: add .NS, BSE: add .BO, US: plain ticker").strip().upper()
-pdfs = col2.file_uploader(
-    "Concall transcripts or results (optional)", type="pdf", accept_multiple_files=True
-)
+pdfs = col2.file_uploader("Concall transcripts or results (optional)", type="pdf", accept_multiple_files=True)
 focus = st.text_input(
     "Debate question (optional)",
     placeholder="Is this stock worth buying at the current valuation for a 2-year hold?",
@@ -276,9 +330,9 @@ run = st.button("Start debate", type="primary")
 
 if run:
     if not api_key:
-        st.error("Add your Anthropic API key in the sidebar to start.")
+        st.error("Add your API key in the sidebar to start.")
         st.stop()
-    client = anthropic.Anthropic(api_key=api_key)
+    client = make_client()
 
     # 1. Market data
     try:
@@ -298,8 +352,8 @@ if run:
                 digest = digest_pdfs(client, pdfs, company)
             with st.expander("Document digest", expanded=False):
                 st.markdown(digest)
-        except anthropic.APIError as e:
-            st.warning(f"Couldn't read the PDFs, continuing with market data only. ({e})")
+        except Exception as e:
+            st.warning(f"Couldn't read the PDFs, continuing with market data only. {friendly_error(e)}")
 
     evidence = f"=== MARKET FACTS ===\n{sheet}"
     if digest:
@@ -308,34 +362,38 @@ if run:
     # 3. Debate
     st.subheader("The debate")
     turns = []
-    try:
-        for i in range(rounds):
-            rname = round_name(i, rounds)
-            for side in ("bull", "bear"):
-                so_far = transcript_text(turns) or "(No arguments yet. You speak first.)"
-                user = f"DEBATE SO FAR:\n{so_far}\n\nGive your {rname.lower()} statement now."
-                with st.chat_message(side, avatar=AVATAR[side]):
-                    st.markdown(f"**{LABEL[side]}: {rname}**")
-                    text = st.write_stream(
-                        stream_turn(client, debater_system(side, company, evidence, focus), user)
-                    )
-                turns.append({"round": rname, "side": side, "text": text})
-    except anthropic.APIError as e:
-        st.error(f"The API returned an error: {e}")
-        st.stop()
+    for i in range(rounds):
+        rname = round_name(i, rounds)
+        for side in ("bull", "bear"):
+            so_far = transcript_text(turns) or "(No arguments yet. You speak first.)"
+            user = f"DEBATE SO FAR:\n{so_far}\n\nGive your {rname.lower()} statement now."
+            system = debater_system(side, company, evidence, focus)
+            for attempt in range(3):
+                try:
+                    with st.chat_message(side, avatar=AVATAR[side]):
+                        st.markdown(f"**{LABEL[side]}: {rname}**")
+                        text = st.write_stream(stream(client, system, user, max_words * 2 + 200))
+                    break
+                except Exception as e:
+                    if is_rate_limit(e) and attempt < 2:
+                        st.info("Hit the free-tier rate limit. Waiting 30 seconds, then continuing...")
+                        time.sleep(30)
+                    else:
+                        st.error(friendly_error(e))
+                        st.stop()
+            turns.append({"round": rname, "side": side, "text": text})
 
     # 4. Judge
-    with st.spinner("The judge is deliberating..."):
-        msg = client.messages.create(
-            model=model,
-            max_tokens=1500,
-            system=JUDGE_SYSTEM,
-            messages=[{
-                "role": "user",
-                "content": f"EVIDENCE:\n{evidence}\n\nDEBATE TRANSCRIPT:\n{transcript_text(turns)}",
-            }],
-        )
-    raw = "".join(b.text for b in msg.content if b.type == "text")
+    try:
+        with st.spinner("The judge is deliberating..."):
+            raw = generate(
+                client,
+                f"EVIDENCE:\n{evidence}\n\nDEBATE TRANSCRIPT:\n{transcript_text(turns)}",
+                system=JUDGE_SYSTEM, max_tokens=1500,
+            )
+    except Exception as e:
+        st.error(friendly_error(e))
+        st.stop()
     verdict = parse_json(raw)
     show_verdict(verdict, raw)
 
