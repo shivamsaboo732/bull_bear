@@ -3,3 +3,5 @@ anthropic
 google-genai
 yfinance
 pandas
+altair
+python-dotenv
