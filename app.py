@@ -18,6 +18,7 @@ import math
 import os
 import re
 import time
+from datetime import date
 
 import altair as alt
 import anthropic
@@ -41,6 +42,40 @@ MODELS = {
     "Anthropic Claude": ["claude-sonnet-5-5", "claude-haiku-4-5"],
 }
 KEY_ENV = {"Google Gemini (free tier)": "GEMINI_API_KEY", "Anthropic Claude": "ANTHROPIC_API_KEY"}
+SESSION_LIMIT = 3  # demo debates per visitor (per browser session) on the shared key
+
+
+def secret(name):
+    """Read a value from Streamlit Cloud secrets, or None when running locally without them."""
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+def shared_key_for(provider):
+    """Return (key, where it came from). 'cloud' keys are shared with visitors, so they get limits."""
+    name = KEY_ENV[provider]
+    if secret(name):
+        return secret(name), "cloud"
+    if os.getenv(name):
+        return os.getenv(name), "local"
+    return "", None
+
+
+@st.cache_resource
+def demo_usage():
+    """One counter shared by every visitor of the hosted app. Resets each day (and when the app restarts)."""
+    return {"date": None, "count": 0}
+
+
+def demo_debates_left():
+    usage = demo_usage()
+    today = date.today().isoformat()
+    if usage["date"] != today:
+        usage["date"], usage["count"] = today, 0
+    daily_limit = int(secret("DEMO_DAILY_LIMIT") or 30)
+    return max(daily_limit - usage["count"], 0)
 
 
 # ---------------------------------------------------------------- Sidebar
@@ -48,12 +83,24 @@ with st.sidebar:
     st.header("Settings")
     provider = st.radio("AI provider", list(MODELS))
     GEMINI = provider.startswith("Google")
-    env_key = os.getenv(KEY_ENV[provider], "")
-    api_key = st.text_input("Gemini API key" if GEMINI else "Anthropic API key", type="password", value=env_key)
-    if env_key:
-        st.caption("Key loaded from your .env file.")
+    shared_key, key_source = shared_key_for(provider)
+    key_name = "Gemini API key" if GEMINI else "Anthropic API key"
+    # The shared key is never put into the text box, so visitors can't reveal it with the eye icon
+    user_key = st.text_input(
+        f"{key_name} (optional)" if shared_key else key_name, type="password",
+        help="Get a free Gemini key at aistudio.google.com. Your key is only used for this session and isn't saved.",
+    ).strip()
+    api_key = user_key or shared_key
+    demo_mode = not user_key and key_source == "cloud"
+
+    if demo_mode:
+        left = min(demo_debates_left(), SESSION_LIMIT - st.session_state.get("demo_runs", 0))
+        st.caption(f"Using the free demo key: {max(left, 0)} debate(s) left for you. Add your own key for unlimited use.")
+    elif not user_key and key_source == "local":
+        st.caption("Using the key from your .env file.")
+
     model = st.selectbox(
-        "Model", MODELS[provider],
+        "Model", MODELS[provider][:1] if demo_mode else MODELS[provider],
         help="Lite models are faster and less likely to be busy on the free tier.",
     )
 
@@ -536,6 +583,7 @@ with st.container(border=True):
     pdfs = col2.file_uploader(
         "Concalls, results, or investor presentations (optional)",
         type="pdf", accept_multiple_files=True,
+        help="Files are sent to the AI provider for analysis. Use public filings only, not private documents.",
     )
     context = st.text_input(
         "Context or question for the debate (optional)",
@@ -547,6 +595,15 @@ if run:
     if not api_key:
         st.error("Add your API key in the sidebar to start.")
         st.stop()
+    if demo_mode:
+        if st.session_state.get("demo_runs", 0) >= SESSION_LIMIT:
+            st.error(f"You've used your {SESSION_LIMIT} free demo debates. Add your own free Gemini key in the sidebar to keep going.")
+            st.stop()
+        if demo_debates_left() <= 0:
+            st.error("Today's free demo debates are used up. Add your own free Gemini key in the sidebar, or try again tomorrow.")
+            st.stop()
+        st.session_state["demo_runs"] = st.session_state.get("demo_runs", 0) + 1
+        demo_usage()["count"] += 1
     client = make_client()
     progress = Progress(total=2 + (1 if pdfs else 0) + rounds * 2)
     verdict_slot = st.container()  # filled in at the end, so the verdict shows at the top
